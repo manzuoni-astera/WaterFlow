@@ -62,30 +62,33 @@ DEFAULT_DENSITY_RATIO = 0.6  # density mode, waters per ASU residue
 # ---------------------------------------------------------------------------
 
 
-def load_state_dict_lenient(
+def load_checkpoint(
     model: nn.Module, checkpoint_path: Path, device: torch.device
 ) -> None:
-    """Load weights with strict=False, warning on any missing/unexpected keys.
+    """Load model weights, tolerating only weights for modules since removed.
 
-    A checkpoint and the current model can differ by a few layers across
-    versions; a strict load would raise. The matched weights still transfer,
-    unmatched checkpoint keys are dropped, and any unmatched model layer stays
-    at init. Missing or unexpected keys are warned, not fatal.
+    A shipped checkpoint can carry tensors for features later dropped from the
+    code, whose flags linger (off) in the recorded config. Those are unexpected
+    keys and are safe to drop. A missing key is the opposite: a live model
+    parameter got no weight and would run at init, a silent error, so refuse it.
+    A shape mismatch is a genuine incompatibility and raises from load_state_dict.
     """
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state = ckpt.get("model_state_dict", ckpt)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        logger.warning(
-            f"{checkpoint_path.name}: {len(missing)} params left at init "
-            f"(e.g. {missing[:3]})"
+    result = model.load_state_dict(state, strict=False)
+    if result.missing_keys:
+        raise RuntimeError(
+            f"{checkpoint_path.name}: {len(result.missing_keys)} model params "
+            f"missing from the checkpoint (e.g. {result.missing_keys[:3]}); "
+            "refusing to run with layers left at init."
         )
-    if unexpected:
-        logger.warning(
-            f"{checkpoint_path.name}: {len(unexpected)} checkpoint keys ignored "
-            f"(e.g. {unexpected[:3]})"
+    if result.unexpected_keys:
+        logger.info(
+            f"{checkpoint_path.name}: dropped {len(result.unexpected_keys)} "
+            f"checkpoint keys with no matching module (e.g. "
+            f"{result.unexpected_keys[:3]})"
         )
     model.eval()
 
@@ -157,17 +160,17 @@ def select_waters(
 # ---------------------------------------------------------------------------
 
 
-def _input_frame(struc_path: str) -> tuple[bts.AtomArray, np.ndarray, str | None]:
-    """Atoms to write out, the ASU protein centroid, and the input space group.
+def _input_frame(struc_path: str) -> tuple[bts.AtomArray, str | None]:
+    """Atoms to write out and the input space group.
 
-    The centroid is the one build_inference_graph centred on, so adding it back
-    returns predicted waters to the input frame. Hets are always written, whether
-    or not the flow model saw them: the output is the input structure plus waters.
+    Hets are always written, whether or not the flow model saw them: the output
+    is the input structure plus waters. Predictions are returned to the input
+    frame with the graph's `.center`, so the centroid is defined only once, in
+    build_inference_graph.
     """
     protein_atoms, _waters, ligand_atoms = parse_asu_with_biotite(struc_path)
-    center = protein_atoms.coord.mean(axis=0)
     kept = protein_atoms + ligand_atoms if len(ligand_atoms) else protein_atoms
-    return kept, center, read_space_group(struc_path)
+    return kept, read_space_group(struc_path)
 
 
 def predict_structures(
@@ -251,10 +254,9 @@ def predict_structures(
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for graph, candidate_pos, (kept, center, space_group), name in zip(
+    for graph, candidate_pos, (kept, space_group), name in zip(
         graphs, candidates, frames, out_names
     ):
-        candidate_pos = torch.as_tensor(candidate_pos, dtype=torch.float32)
         conf = score_candidates(conf_model, graph, candidate_pos, device)
         sel_pos, sel_conf = select_waters(
             candidate_pos,
@@ -267,7 +269,7 @@ def predict_structures(
         if len(sel_pos) == 0:
             logger.warning(f"{name}: no waters selected")
         # Back to the input frame, then write structure + scored coordinates.
-        water_xyz = sel_pos.numpy() + center
+        water_xyz = sel_pos.numpy() + graph.center.numpy()
         structure = merge_waters(kept, water_xyz)
         write_structure(
             structure,
@@ -446,7 +448,7 @@ def main() -> None:
         args.include_mates = flow_config.get("include_mates", False)
 
     flow_model = build_model_from_config(flow_config, device)
-    load_state_dict_lenient(flow_model, ckpt_dir / "flow.pt", device)
+    load_checkpoint(flow_model, ckpt_dir / "flow.pt", device)
     flow_matcher = FlowMatcher(
         model=flow_model,
         sampling_strategy=flow_config.get("sampling_strategy", "uniform_ball"),
@@ -455,7 +457,7 @@ def main() -> None:
     conf_config = json.loads((ckpt_dir / "confidence_config.json").read_text())
     conf_config = conf_config.get("flow_config", conf_config)  # confidence runs nest it
     conf_model = build_confidence_model(conf_config, device)
-    load_state_dict_lenient(conf_model, ckpt_dir / "confidence.pt", device)
+    load_checkpoint(conf_model, ckpt_dir / "confidence.pt", device)
 
     paths = _collect_struc_paths(args)
     _check_embeddings(paths, flow_config.get("encoder_type", "gvp"), args.processed_dir)

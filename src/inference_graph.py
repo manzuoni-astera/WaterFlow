@@ -78,7 +78,8 @@ def build_inference_graph(
 
     Returns:
         HeteroData with centred protein nodes (+ optional embeddings), empty
-        water nodes, and cached PP edges.
+        water nodes, cached PP edges, and `.center`, the (3,) ASU protein
+        centroid that coordinates were shifted by.
     """
     struc_path = str(struc_path)
     if cache_key is None:
@@ -192,6 +193,10 @@ def build_inference_graph(
         processed_dir=processed_dir,
         cache_load_mmap=cache_load_mmap,
     )
+
+    # ASU protein centroid in the input frame. Coordinates here are centred on
+    # it, so a caller adds it back to return predictions to the input frame.
+    data.center = center.squeeze(0)  # (3,)
 
     if out_dir is not None:
         out_dir = Path(out_dir)

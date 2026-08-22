@@ -1,6 +1,6 @@
 """Tests for scripts/predict_waters.py -- end-to-end water prediction.
 
-Unit tests cover the pure pieces (selection, model build, lenient load, path
+Unit tests cover the pure pieces (selection, model build, checkpoint load, path
 collection, frame recovery). The integration test runs the whole pipeline with
 tiny untrained gvp models, so it needs no trained checkpoints or embeddings.
 """
@@ -16,7 +16,7 @@ from scripts.predict_waters import (
     _check_embeddings,
     _collect_struc_paths,
     _input_frame,
-    load_state_dict_lenient,
+    load_checkpoint,
     parse_args,
     predict_structures,
     select_waters,
@@ -24,6 +24,7 @@ from scripts.predict_waters import (
 from src.confidence import build_confidence_model, ConfidenceGVP
 from src.dataset import parse_asu_with_biotite
 from src.flow import FlowMatcher, FlowWaterGVP
+from src.inference_graph import build_inference_graph
 from src.structure_io import read_space_group
 
 
@@ -123,21 +124,45 @@ class TestModelBuildAndLoad:
         model = build_confidence_model(cfg, torch.device("cpu"))
         assert isinstance(model, ConfidenceGVP)
 
-    def test_lenient_load_round_trips(self, tmp_path):
+    def test_load_round_trips(self, tmp_path):
         cfg = {"encoder_type": "gvp", "hidden_s": 64, "hidden_v": 8, "flow_layers": 1}
         m1 = build_confidence_model(cfg, torch.device("cpu"))
         ckpt = tmp_path / "best.pt"
         torch.save({"model_state_dict": m1.state_dict()}, ckpt)
 
         m2 = build_confidence_model(cfg, torch.device("cpu"))
-        load_state_dict_lenient(m2, ckpt, torch.device("cpu"))  # no raise
+        load_checkpoint(m2, ckpt, torch.device("cpu"))  # no raise
         assert not m2.training  # switched to eval
 
     def test_missing_checkpoint_raises(self, tmp_path):
         cfg = {"encoder_type": "gvp", "hidden_s": 64, "hidden_v": 8, "flow_layers": 1}
         model = build_confidence_model(cfg, torch.device("cpu"))
         with pytest.raises(FileNotFoundError):
-            load_state_dict_lenient(model, tmp_path / "nope.pt", torch.device("cpu"))
+            load_checkpoint(model, tmp_path / "nope.pt", torch.device("cpu"))
+
+    def test_extra_checkpoint_keys_tolerated(self, tmp_path):
+        # A checkpoint with tensors for a module the model no longer has (here a
+        # second layer) loads fine: the surplus keys are dropped.
+        base = {"encoder_type": "gvp", "hidden_s": 64, "hidden_v": 8}
+        big = build_confidence_model({**base, "flow_layers": 2}, torch.device("cpu"))
+        ckpt = tmp_path / "big.pt"
+        torch.save({"model_state_dict": big.state_dict()}, ckpt)
+
+        small = build_confidence_model({**base, "flow_layers": 1}, torch.device("cpu"))
+        load_checkpoint(small, ckpt, torch.device("cpu"))  # no raise
+        assert not small.training
+
+    def test_missing_key_raises(self, tmp_path):
+        # A checkpoint lacking a live parameter (here a second layer) would leave
+        # it at init, so the load must fail loud rather than warn.
+        base = {"encoder_type": "gvp", "hidden_s": 64, "hidden_v": 8}
+        small = build_confidence_model({**base, "flow_layers": 1}, torch.device("cpu"))
+        ckpt = tmp_path / "small.pt"
+        torch.save({"model_state_dict": small.state_dict()}, ckpt)
+
+        big = build_confidence_model({**base, "flow_layers": 2}, torch.device("cpu"))
+        with pytest.raises(RuntimeError, match="missing from the checkpoint"):
+            load_checkpoint(big, ckpt, torch.device("cpu"))
 
 
 @pytest.mark.unit
@@ -166,12 +191,19 @@ class TestInputsAndFrame:
         assert paths == []
 
     def test_input_frame(self, pdb_4h0b):
-        kept, center, space_group = _input_frame(pdb_4h0b)
+        kept, space_group = _input_frame(pdb_4h0b)
         protein, _w, lig = parse_asu_with_biotite(pdb_4h0b)
         assert int((kept.res_name == "HOH").sum()) == 0
         assert len(kept) == len(protein) + len(lig)
-        assert np.allclose(center, protein.coord.mean(axis=0))
         assert space_group == "P 6"
+
+    def test_graph_center_is_protein_centroid(self, pdb_4h0b):
+        # predict_waters adds graph.center back to un-centre predictions, so it
+        # must equal the ASU protein centroid the graph was built on.
+        graph = build_inference_graph(pdb_4h0b, encoder_type="gvp")
+        protein, _w, _lig = parse_asu_with_biotite(pdb_4h0b)
+        assert graph.center.shape == (3,)
+        assert np.allclose(graph.center.numpy(), protein.coord.mean(axis=0), atol=1e-4)
 
 
 @pytest.mark.unit
