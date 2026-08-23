@@ -10,6 +10,8 @@ Usage:
     python -m scripts.inference \
         --run_dir /path/to/run_directory \
         --pdb_list /path/to/pdb_list.txt \
+        --processed_dir /path/to/cache \
+        --base_pdb_dir /path/to/pdbs \
         --output_dir /path/to/output \
         --method rk4 \
         --num_steps 100 \

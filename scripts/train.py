@@ -14,6 +14,7 @@ Usage:
         --train_list /path/to/train.txt \\
         --val_list /path/to/val.txt \\
         --processed_dir /path/to/cache \\
+        --base_pdb_dir /path/to/pdbs \\
         --epochs 200 \\
         --batch_size 4
 """

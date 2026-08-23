@@ -164,9 +164,7 @@ def _input_frame(struc_path: str) -> tuple[bts.AtomArray, str | None]:
     """Atoms to write out and the input space group.
 
     Hets are always written, whether or not the flow model saw them: the output
-    is the input structure plus waters. Predictions are returned to the input
-    frame with the graph's `.center`, so the centroid is defined only once, in
-    build_inference_graph.
+    is the input structure plus waters.
     """
     protein_atoms, _waters, ligand_atoms = parse_asu_with_biotite(struc_path)
     kept = protein_atoms + ligand_atoms if len(ligand_atoms) else protein_atoms
@@ -185,11 +183,10 @@ def predict_structures(
 
     With --geometry_cache set, the flow-model inputs (inference graphs) are cached
     at <geometry_cache>/<name>.pt and the flow outputs (candidate waters) at
-    <geometry_cache>/candidates/<name>.pt. When the mates model is used the cached
-    names carry a `_mates` suffix (<name>_mates.pt), so mates and mates_off runs
-    can share one cache dir without reusing each other's graph. Either is reused
-    when present, so a re-run skips graph construction and flow sampling for
-    cached structures.
+    <geometry_cache>/candidates/<name>.pt. Mates runs use <name>_mates.pt, so
+    mates and mates_off runs can share one cache dir. Either is reused when
+    present, so a re-run skips graph construction and flow sampling for cached
+    structures.
     """
     cache = Path(args.geometry_cache) if args.geometry_cache else None
     cand_cache = cache / "candidates" if cache else None
@@ -320,14 +317,16 @@ def _collect_struc_paths(args: argparse.Namespace) -> list[str]:
 def _check_embeddings(
     paths: list[str], encoder_type: str, processed_dir: str | None
 ) -> None:
-    """Fail fast (not deep in graph building) if an esm/slae embedding is missing.
+    """Fail before any graph is built if an esm/slae embedding is missing.
 
     esm/slae look up <processed_dir>/<encoder_type>/<stem>.pt per input; gvp needs
     none and is skipped.
     """
     if encoder_type == "gvp":
         return
-    emb_dir = Path(processed_dir or ".") / encoder_type
+    if processed_dir is None:
+        raise SystemExit(f"--processed_dir is required for encoder_type={encoder_type}")
+    emb_dir = Path(processed_dir) / encoder_type
     missing = [p for p in paths if not (emb_dir / f"{Path(p).stem}.pt").exists()]
     if missing:
         raise SystemExit(
@@ -368,10 +367,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Directory to cache flow-model inputs (inference graphs) as "
         "<name>.pt, with flow outputs (candidate waters) under a candidates/ "
-        "subdir. Mates runs get a `_mates` suffix (<name>_mates.pt), so mates and "
-        "mates_off can share one dir without colliding. Both are reused when "
-        "present, so a re-run skips graph construction and flow sampling for "
-        "cached structures. Off by default.",
+        "subdir. Mates runs use <name>_mates.pt, so mates and mates_off can share "
+        "one dir. Both are reused when present, so a re-run skips graph "
+        "construction and flow sampling for cached structures. Off by default.",
     )
     p.add_argument("--out_dir", required=True)
     p.add_argument("--out_format", default=".pdb", choices=[".pdb", ".cif"])

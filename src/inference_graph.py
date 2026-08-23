@@ -78,7 +78,7 @@ def build_inference_graph(
 
     Returns:
         HeteroData with centred protein nodes (+ optional embeddings), empty
-        water nodes, cached PP edges, and `.center`, the (3,) ASU protein
+        water nodes, cached PP edges, and .center, the (3,) ASU protein
         centroid that coordinates were shifted by.
     """
     struc_path = str(struc_path)
