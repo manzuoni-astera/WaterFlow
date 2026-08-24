@@ -2,6 +2,21 @@
 
 Predicting water molecule placements on protein surfaces using flow matching conditioned on learned protein structure embeddings.
 
+## ACTL
+
+In the diffuse namespace, launch the catalog image from this checkout:
+
+```sh
+actl pod up waterflow --profile single --image waterflow --pvc-size 100Gi -n diffuse --yes
+```
+
+The diffuse profile mounts shared storage at `/mnt/diffuse-shared`; the image
+exposes `/mnt/diffuse-shared/waterflow` as `/data` for PDBs, caches,
+checkpoints, outputs, logs, and optional split files. The checkout itself
+syncs to `/home/dev/workspace`, so its `splits/` directory is available without
+copying it to shared storage. The `waterflow` command uses the synced checkout
+when present, while preserving the image's virtual environment.
+
 ## Project Structure
 
 ```

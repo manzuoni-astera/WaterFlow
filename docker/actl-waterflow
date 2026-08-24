@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -d /mnt/diffuse-shared ]; then
+  mkdir -p /mnt/diffuse-shared/waterflow/{pdb,cache,checkpoints,outputs,logs,splits} 2>/dev/null || true
+fi
+
+entrypoint=/app/entrypoint.sh
+if [ -x /home/dev/workspace/docker/entrypoint.sh ] && [ -d /home/dev/workspace/scripts ]; then
+  export WATERFLOW_APP_DIR=/home/dev/workspace
+  entrypoint=/home/dev/workspace/docker/entrypoint.sh
+fi
+
+exec "${entrypoint}" "$@"
