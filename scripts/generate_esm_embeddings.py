@@ -242,8 +242,7 @@ def main() -> None:
     if args.struc:
         # Key by file stem, matching how predict_waters looks embeddings up.
         entries = [
-            {"cache_key": p.stem, "struc_path": p, "pdb_id": p.stem}
-            for p in args.struc
+            {"cache_key": p.stem, "struc_path": p, "pdb_id": p.stem} for p in args.struc
         ]
         logger.info(f"Embedding {len(entries)} structure(s) passed via --struc")
     else:

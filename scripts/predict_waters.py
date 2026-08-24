@@ -8,7 +8,7 @@ checkpoint, cluster and threshold, then write the input structure with the
 predicted waters added (`<name>_pred.pdb|cif`) and a `<name>_waters.txt` of
 `x y z confidence` rows. No ground truth is involved.
 
-NOTE: scripts/inference.py on the other hand, evaluates the flow model alone, 
+NOTE: scripts/inference.py on the other hand, evaluates the flow model alone,
 on cached training-format graphs, against the ground-truth waters.
 
 For esm/slae encoders the protein embeddings must already be in

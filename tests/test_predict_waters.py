@@ -327,7 +327,12 @@ class TestEndToEnd:
                 out_format=".pdb",
             )
             predict_structures(
-                [pdb_4h0b], flow_matcher, conf_model, {"encoder_type": "gvp"}, args, device
+                [pdb_4h0b],
+                flow_matcher,
+                conf_model,
+                {"encoder_type": "gvp"},
+                args,
+                device,
             )
 
         run(tmp_path / "out1")
@@ -374,7 +379,12 @@ class TestEndToEnd:
                 out_format=".pdb",
             )
             predict_structures(
-                [pdb_4h0b], flow_matcher, conf_model, {"encoder_type": "gvp"}, args, device
+                [pdb_4h0b],
+                flow_matcher,
+                conf_model,
+                {"encoder_type": "gvp"},
+                args,
+                device,
             )
 
         run(False, tmp_path / "off")

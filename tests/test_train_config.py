@@ -190,12 +190,18 @@ def test_parse_args_rejects_embedding_dim_for_gvp(monkeypatch):
         "sys.argv",
         [
             "train.py",
-            "--train_list", "train.txt",
-            "--val_list", "val.txt",
-            "--processed_dir", "cache",
-            "--base_pdb_dir", "pdbs",
-            "--encoder_type", "gvp",
-            "--embedding_dim", "128",
+            "--train_list",
+            "train.txt",
+            "--val_list",
+            "val.txt",
+            "--processed_dir",
+            "cache",
+            "--base_pdb_dir",
+            "pdbs",
+            "--encoder_type",
+            "gvp",
+            "--embedding_dim",
+            "128",
         ],
     )
 
@@ -213,10 +219,14 @@ def test_dataset_defaults_match_train_defaults(monkeypatch):
         "sys.argv",
         [
             "train.py",
-            "--train_list", "t.txt",
-            "--val_list", "v.txt",
-            "--processed_dir", "cache",
-            "--base_pdb_dir", "pdbs",
+            "--train_list",
+            "t.txt",
+            "--val_list",
+            "v.txt",
+            "--processed_dir",
+            "cache",
+            "--base_pdb_dir",
+            "pdbs",
         ],
     )
     args = parse_args()
