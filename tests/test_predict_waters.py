@@ -246,6 +246,7 @@ class TestEndToEnd:
         out_dir = tmp_path / "out"
         args = SimpleNamespace(
             processed_dir=None,
+            ckpt_dir="c",
             geometry_cache=None,
             include_mates=False,
             method="euler",
@@ -295,8 +296,7 @@ class TestEndToEnd:
         assert ((rows[:, 3] >= 0) & (rows[:, 3] <= 1)).all()
 
     def test_geometry_cache_writes_and_reuses(self, pdb_4h0b, gvp_encoder, tmp_path):
-        """--geometry_cache stores the flow input graph (<name>.pt) and candidate
-        waters (candidates/<name>.pt); a second run reuses them, so its predicted
+        """A second run reuses the cached graph and candidates, so its predicted
         waters are identical instead of freshly sampled."""
         device = torch.device("cpu")
         flow_model = FlowWaterGVP(
@@ -314,6 +314,7 @@ class TestEndToEnd:
         def run(out_dir):
             args = SimpleNamespace(
                 processed_dir=None,
+                ckpt_dir="ckpts/mates",
                 geometry_cache=str(cache),
                 include_mates=False,
                 method="euler",
@@ -330,9 +331,8 @@ class TestEndToEnd:
             )
 
         run(tmp_path / "out1")
-        # include_mates=False -> no suffix on the cached names.
         graph_pt = cache / "4h0b_final.pt"
-        cand_pt = cache / "candidates" / "4h0b_final.pt"
+        cand_pt = cache / "candidates" / "4h0b_final_mates_euler2_r1.0.pt"
         assert graph_pt.exists(), "flow-input graph not cached"
         assert cand_pt.exists(), "candidate waters not cached"
         assert "candidate_pos" in torch.load(cand_pt, weights_only=False)
@@ -344,9 +344,7 @@ class TestEndToEnd:
         assert r1.shape == r2.shape and np.allclose(r1, r2, atol=1e-4)
 
     def test_geometry_cache_separates_mates(self, pdb_4h0b, gvp_encoder, tmp_path):
-        """mates and mates_off share one --geometry_cache dir without colliding:
-        mates runs write <name>_mates.pt, mates_off runs write <name>.pt, so
-        neither reuses the other's cached graph or candidates."""
+        """mates and mates_off runs share one cache dir under distinct names."""
         device = torch.device("cpu")
         flow_model = FlowWaterGVP(
             encoder=gvp_encoder, hidden_dims=(64, 8), layers=1
@@ -363,6 +361,7 @@ class TestEndToEnd:
         def run(include_mates, out_dir):
             args = SimpleNamespace(
                 processed_dir=None,
+                ckpt_dir="ckpts/mates",
                 geometry_cache=str(cache),
                 include_mates=include_mates,
                 method="euler",
@@ -382,5 +381,6 @@ class TestEndToEnd:
         run(True, tmp_path / "on")
         assert (cache / "4h0b_final.pt").exists()
         assert (cache / "4h0b_final_mates.pt").exists()
-        assert (cache / "candidates" / "4h0b_final.pt").exists()
-        assert (cache / "candidates" / "4h0b_final_mates.pt").exists()
+        cands = cache / "candidates"
+        assert (cands / "4h0b_final_mates_euler2_r1.0.pt").exists()
+        assert (cands / "4h0b_final_mates_mates_euler2_r1.0.pt").exists()

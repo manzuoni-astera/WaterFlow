@@ -194,8 +194,7 @@ def build_inference_graph(
         cache_load_mmap=cache_load_mmap,
     )
 
-    # ASU protein centroid in the input frame. Coordinates here are centred on
-    # it, so a caller adds it back to return predictions to the input frame.
+    # ASU protein centroid; adding it back returns predictions to the input frame.
     data.center = center.squeeze(0)  # (3,)
 
     if out_dir is not None:

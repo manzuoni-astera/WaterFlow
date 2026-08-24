@@ -1353,8 +1353,8 @@ def main():
             json.dump(config_dict, f, indent=2)
         logger.info(f"Configuration saved to: {config_file}")
 
-    # wandb is opt-in: --wandb_project on rank 0 logs online (needs a login);
-    # otherwise "disabled", where wandb.log/finish are no-ops and no key is needed.
+    # wandb logs only when --wandb_project is set, on rank 0; disabled mode
+    # makes wandb.log/finish no-ops and needs no login.
     wandb.init(
         project=args.wandb_project,
         dir=args.wandb_dir,
