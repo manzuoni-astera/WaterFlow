@@ -185,7 +185,7 @@ def test_inference_build_model_from_config_rescues_for_scaled_gaussian(device):
     assert model.updater.rescue_isolated
 
 
-def test_parse_args_rejects_embedding_dim_for_gvp(monkeypatch):
+def test_parse_args_rejects_embedding_dim_for_gvp(monkeypatch, capsys):
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -205,8 +205,10 @@ def test_parse_args_rejects_embedding_dim_for_gvp(monkeypatch):
         ],
     )
 
+    # argparse reports its errors on stderr and exits with code 2.
     with pytest.raises(SystemExit):
         parse_args()
+    assert "--embedding_dim" in capsys.readouterr().err
 
 
 def test_dataset_defaults_match_train_defaults(monkeypatch):
@@ -238,10 +240,14 @@ def test_dataset_defaults_match_train_defaults(monkeypatch):
         if v.default is not inspect.Parameter.empty
     }
 
-    assert args.min_water_residue_ratio == dataset_defaults["min_water_residue_ratio"]
-    assert args.max_protein_dist == dataset_defaults["max_protein_dist"]
-    assert args.max_com_dist == dataset_defaults["max_com_dist"]
-    assert args.include_ligands == dataset_defaults["include_ligands"]
+    # train.py defaults to the shipped-model setup (esm encoder, no mates);
+    # the dataset keeps its library defaults. Every other shared parameter
+    # must agree.
+    intentionally_different = {"encoder_type", "include_mates"}
+    shared = set(vars(args)) & set(dataset_defaults) - intentionally_different
+    assert shared, "no shared parameters found between train.py and the dataset"
+    for name in sorted(shared):
+        assert getattr(args, name) == dataset_defaults[name], name
 
 
 def test_inference_extracts_filter_config_from_training_config():

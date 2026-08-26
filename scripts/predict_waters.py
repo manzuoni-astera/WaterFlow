@@ -19,8 +19,9 @@ flow_config.json and confidence_config.json. It defaults to the mates models
 shipped in the repo (checkpoints/mates); pass checkpoints/mates_off to run
 without symmetry mates.
 
-Usage:
-    python -m scripts.predict_waters --struc protein.cif --out_dir out/
+Usage (the default models use esm, so embeddings come first):
+    python -m scripts.generate_esm_embeddings --struc protein.cif --processed_dir cache/
+    python -m scripts.predict_waters --struc protein.cif --processed_dir cache/ --out_dir out/
 
     Run without symmetry mates:
         ... --ckpt_dir checkpoints/mates_off
@@ -34,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from collections import Counter
 from pathlib import Path
 
 import biotite.structure as bts
@@ -55,6 +57,9 @@ from src.utils import setup_logging_for_tqdm
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.5  # confidence mode
 DEFAULT_DENSITY_RATIO = 0.6  # density mode, waters per ASU residue
+
+# Anchor the shipped-checkpoint default to the repo, not the working directory.
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 # ---------------------------------------------------------------------------
@@ -166,59 +171,50 @@ def _input_frame(struc_path: str) -> tuple[bts.AtomArray, str | None]:
     return kept, read_space_group(struc_path)
 
 
+def _candidate_path(cache: Path, name: str) -> Path:
+    """Cached sampled waters for one structure inside the predict cache."""
+    return cache / "candidates" / f"{name}.pt"
+
+
 def predict_structures(
     struc_paths: list[str],
-    flow_matcher: FlowMatcher,
+    flow_matcher: FlowMatcher | None,
     conf_model: ConfidenceGVP,
     flow_config: dict,
     args: argparse.Namespace,
     device: torch.device,
+    cache: Path | None = None,
 ) -> None:
     """Predict + write final waters for a batch of structures.
 
-    With --geometry_cache set, inference graphs are cached at
-    <geometry_cache>/<name>[_mates].pt and candidate waters at
-    <geometry_cache>/candidates/<name>[_mates]_<ckpt>_<method><steps>_r<ratio>.pt,
-    and both are reused when present.
+    With cache set, flow input graphs are reused from <cache>/<name>.pt and
+    candidate waters from _candidate_path(cache, name); missing entries are
+    computed and written. The caller derives the directory from the run
+    settings, so the structure name alone identifies a file here.
     """
-    cache = Path(args.geometry_cache) if args.geometry_cache else None
-    cand_cache = cache / "candidates" if cache else None
-    mates_tag = "_mates" if args.include_mates else ""
-    cand_tag = (
-        f"{mates_tag}_{Path(args.ckpt_dir).resolve().name}"
-        f"_{args.method}{args.num_steps}_r{args.water_ratio}"
-    )
-
     graphs, frames, out_names = [], [], []
-    encoder_type = flow_config.get("encoder_type", "gvp")
     for path in struc_paths:
-        name = Path(path).stem
-        graph_pt = cache / f"{name}{mates_tag}.pt" if cache else None
-        if graph_pt is not None and graph_pt.exists():
-            graph = torch.load(graph_pt, weights_only=False)
-        else:
-            graph = build_inference_graph(
+        graphs.append(
+            build_inference_graph(
                 path,
-                encoder_type=encoder_type,
+                encoder_type=flow_config.get("encoder_type", "gvp"),
                 processed_dir=args.processed_dir,
                 include_mates=args.include_mates,
                 include_ligands=flow_config.get("include_ligands", True),
                 cutoff=flow_config.get("cutoff", 8.0),
                 max_neighbors=flow_config.get("max_neighbors", 256),
+                cache_dir=cache,
             )
-            if graph_pt is not None:
-                cache.mkdir(parents=True, exist_ok=True)
-                torch.save(graph, graph_pt)
-        graphs.append(graph)
+        )
         frames.append(_input_frame(path))
-        out_names.append(name)
+        out_names.append(Path(path).stem)
 
     # Candidate waters (centred frame): cached ones are reused, the rest are
     # sampled in one batch.
     candidates: list[torch.Tensor | None] = [None] * len(graphs)
     todo_idx, todo_graphs = [], []
     for i, name in enumerate(out_names):
-        cand_pt = cand_cache / f"{name}{cand_tag}.pt" if cand_cache else None
+        cand_pt = _candidate_path(cache, name) if cache else None
         if cand_pt is not None and cand_pt.exists():
             candidates[i] = torch.load(cand_pt, weights_only=False)["candidate_pos"]
         else:
@@ -226,6 +222,8 @@ def predict_structures(
             todo_graphs.append(graphs[i])
 
     if todo_graphs:
+        if flow_matcher is None:
+            raise RuntimeError("flow model needed for sampling but not loaded")
         results = run_inference_batch(
             flow_matcher,
             todo_graphs,
@@ -234,15 +232,13 @@ def predict_structures(
             device=str(device),
             water_ratio=args.water_ratio,
         )
-        if cand_cache is not None:
-            cand_cache.mkdir(parents=True, exist_ok=True)
         for i, result in zip(todo_idx, results):
             cand = torch.as_tensor(result["water_pred"], dtype=torch.float32)
             candidates[i] = cand
-            if cand_cache is not None:
-                torch.save(
-                    {"candidate_pos": cand}, cand_cache / f"{out_names[i]}{cand_tag}.pt"
-                )
+            if cache is not None:
+                cand_pt = _candidate_path(cache, out_names[i])
+                cand_pt.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({"candidate_pos": cand}, cand_pt)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -285,43 +281,56 @@ def predict_structures(
 
 
 def _collect_struc_paths(args: argparse.Namespace) -> list[str]:
-    """A single --struc, or --pdb_list entries resolved under --base_pdb_dir
+    """--struc files, or --pdb_list entries resolved under --base_pdb_dir
     (with or without a .pdb/.cif extension).
+
+    Outputs, embeddings and cache entries are all keyed by file stem, so
+    duplicate stems are rejected.
     """
     if args.struc:
-        return [args.struc]
-    base = Path(args.base_pdb_dir)
-    names = [
-        ln.strip() for ln in Path(args.pdb_list).read_text().splitlines() if ln.strip()
-    ]
-    paths = []
-    for name in names:
-        if (base / name).suffix.lower() in (".cif", ".pdb"):
-            candidates = [base / name]
-        else:
-            candidates = [base / f"{name}{ext}" for ext in (".cif", ".pdb")]
-        match = next((c for c in candidates if c.exists()), None)
-        if match is not None:
-            paths.append(str(match))
-        else:
-            logger.warning(f"No structure file found for {name!r} under {base}")
+        paths = [str(p) for p in args.struc]
+    else:
+        base = Path(args.base_pdb_dir)
+        names = [
+            ln.strip()
+            for ln in Path(args.pdb_list).read_text().splitlines()
+            if ln.strip()
+        ]
+        paths = []
+        for name in names:
+            if (base / name).suffix.lower() in (".cif", ".pdb"):
+                candidates = [base / name]
+            else:
+                candidates = [base / f"{name}{ext}" for ext in (".cif", ".pdb")]
+            match = next((c for c in candidates if c.exists()), None)
+            if match is not None:
+                paths.append(str(match))
+            else:
+                logger.warning(f"No structure file found for {name!r} under {base}")
+    counts = Counter(Path(p).stem for p in paths)
+    duplicates = sorted(s for s, n in counts.items() if n > 1)
+    if duplicates:
+        raise ValueError(
+            f"Duplicate structure names {duplicates}: outputs and cache entries "
+            "are keyed by file name, so every input needs a distinct one."
+        )
     return paths
 
 
 def _check_embeddings(
     paths: list[str], encoder_type: str, processed_dir: str | None
 ) -> None:
-    """Fail before any graph is built if an esm/slae embedding
+    """Fail before any model is loaded if an esm/slae embedding
     (<processed_dir>/<encoder_type>/<stem>.pt) is missing. gvp needs none.
     """
     if encoder_type == "gvp":
         return
     if processed_dir is None:
-        raise SystemExit(f"--processed_dir is required for encoder_type={encoder_type}")
+        raise ValueError(f"--processed_dir is required for encoder_type={encoder_type}")
     emb_dir = Path(processed_dir) / encoder_type
     missing = [p for p in paths if not (emb_dir / f"{Path(p).stem}.pt").exists()]
     if missing:
-        raise SystemExit(
+        raise ValueError(
             f"Missing {encoder_type} embeddings under {emb_dir} for "
             f"{[Path(p).name for p in missing]}. Generate them first with "
             f"scripts/generate_{encoder_type}_embeddings.py"
@@ -332,14 +341,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--ckpt_dir",
-        default="checkpoints/mates",
+        default=str(REPO_ROOT / "checkpoints" / "mates"),
         help="Directory holding flow.pt, confidence.pt, flow_config.json and "
         "confidence_config.json. Default: the mates models shipped in the repo; "
         "pass checkpoints/mates_off to run without symmetry mates.",
     )
 
     src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--struc", help="A single PDB/CIF file.")
+    src.add_argument("--struc", nargs="+", help="One or more PDB/CIF files.")
     src.add_argument(
         "--pdb_list",
         help="Text file of structure names under --base_pdb_dir, one per line; "
@@ -355,11 +364,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "processed_dir/<encoder_type>.",
     )
     p.add_argument(
-        "--geometry_cache",
+        "--predict_cache",
         default=None,
-        help="Directory to cache inference graphs (<name>[_mates].pt) and, under "
-        "candidates/, sampled waters keyed by checkpoint dir name, method, steps "
-        "and water ratio. Both are reused when present. Off by default.",
+        help="Root directory to reuse flow input graphs and sampled candidate "
+        "waters across runs. Each checkpoint + sampling configuration gets its "
+        "own subdirectory, so runs never mix files. Off by default.",
     )
     p.add_argument("--out_dir", required=True)
     p.add_argument("--out_format", default=".pdb", choices=[".pdb", ".cif"])
@@ -432,23 +441,52 @@ def main() -> None:
 
     ckpt_dir = Path(args.ckpt_dir)
     flow_config = json.loads((ckpt_dir / "flow_config.json").read_text())
+    conf_config = json.loads((ckpt_dir / "confidence_config.json").read_text())
+    conf_config = conf_config.get("flow_config", conf_config)  # confidence runs nest it
     if args.include_mates is None:
         args.include_mates = flow_config.get("include_mates", False)
 
-    flow_model = build_model_from_config(flow_config, device)
-    load_checkpoint(flow_model, ckpt_dir / "flow.pt", device)
-    flow_matcher = FlowMatcher(
-        model=flow_model,
-        sampling_strategy=flow_config.get("sampling_strategy", "uniform_ball"),
-    )
+    # Graphs are built with ESM or with plain GVP, based on the checkpoint
+    flow_encoder = flow_config.get("encoder_type", "gvp")
+    conf_encoder = conf_config.get("encoder_type", "gvp")
+    if conf_encoder not in ("gvp", flow_encoder):
+        raise ValueError(
+            f"Confidence checkpoint uses encoder {conf_encoder!r} but graphs are "
+            f"built for {flow_encoder!r}; use checkpoints whose encoders match."
+        )
 
-    conf_config = json.loads((ckpt_dir / "confidence_config.json").read_text())
-    conf_config = conf_config.get("flow_config", conf_config)  # confidence runs nest it
+    paths = _collect_struc_paths(args)
+    _check_embeddings(paths, flow_encoder, args.processed_dir)
+
+    # Cache subdir named by every setting that shapes its files, so runs with
+    # different settings never share one (the cache_candidates scheme). The
+    # checkpoint is identified by its directory name, so retraining in place
+    # makes the cache stale.
+    cache = None
+    if args.predict_cache:
+        mates = "mates" if args.include_mates else "nomates"
+        cache = Path(args.predict_cache) / (
+            f"{ckpt_dir.resolve().name}_{mates}"
+            f"_{args.method}{args.num_steps}_r{args.water_ratio:g}"
+        )
+
     conf_model = build_confidence_model(conf_config, device)
     load_checkpoint(conf_model, ckpt_dir / "confidence.pt", device)
 
-    paths = _collect_struc_paths(args)
-    _check_embeddings(paths, flow_config.get("encoder_type", "gvp"), args.processed_dir)
+    # The flow checkpoint only samples candidates; skip it when all are cached.
+    if cache is not None and all(
+        _candidate_path(cache, Path(p).stem).exists() for p in paths
+    ):
+        flow_matcher = None
+        logger.info("All candidate waters cached; flow checkpoint not loaded")
+    else:
+        flow_model = build_model_from_config(flow_config, device)
+        load_checkpoint(flow_model, ckpt_dir / "flow.pt", device)
+        flow_matcher = FlowMatcher(
+            model=flow_model,
+            sampling_strategy=flow_config.get("sampling_strategy", "uniform_ball"),
+        )
+
     logger.info(f"Predicting waters for {len(paths)} structure(s) on {device}")
     for start in tqdm(range(0, len(paths), args.batch_size), desc="predict"):
         predict_structures(
@@ -458,6 +496,7 @@ def main() -> None:
             flow_config,
             args,
             device,
+            cache=cache,
         )
 
 

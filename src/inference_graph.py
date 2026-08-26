@@ -54,7 +54,7 @@ def build_inference_graph(
     max_neighbors: int = 256,
     cache_key: str | None = None,
     cache_load_mmap: bool = True,
-    out_dir: str | Path | None = None,
+    cache_dir: str | Path | None = None,
 ) -> HeteroData:
     """Parse a structure into the flow model's HeteroData, ready for sampling.
 
@@ -74,7 +74,11 @@ def build_inference_graph(
         cutoff, max_neighbors: PP radius-graph parameters (match the flow run).
         cache_key: Key for the embedding lookup. Defaults to the file stem
             (e.g. 6eey_final).
-        out_dir: If given, the graph is also saved to out_dir/<cache_key>.pt.
+        cache_dir: If given, the graph is loaded from cache_dir/<cache_key>.pt
+            when present, else built and saved there. Stored graphs hold no
+            embeddings; those are attached from processed_dir on every call.
+            The file records nothing about the build settings, so a cache_dir
+            must only be shared by calls with identical settings.
 
     Returns:
         HeteroData with centred protein nodes (+ optional embeddings), empty
@@ -92,6 +96,17 @@ def build_inference_graph(
             "processed_dir (its <encoder_type> subdir). Run generate_"
             f"{encoder_type}_embeddings.py first."
         )
+
+    graph_path = Path(cache_dir) / f"{cache_key}.pt" if cache_dir is not None else None
+    if graph_path is not None and graph_path.exists():
+        data = torch.load(graph_path, weights_only=False)
+        _attach_embeddings(
+            data,
+            encoder_type=encoder_type,
+            processed_dir=processed_dir,
+            cache_load_mmap=cache_load_mmap,
+        )
+        return data
 
     # Waters are prediction targets, not inputs -- drop them and keep protein + hets.
     protein_atoms, _waters, ligand_atoms = parse_asu_with_biotite(struc_path)
@@ -189,19 +204,22 @@ def build_inference_graph(
         pp_unit_vectors=pp_unit_vectors,
         pp_rbf=pp_rbf,
         pdb_id=cache_key,
-        encoder_type=encoder_type,
-        processed_dir=processed_dir,
-        cache_load_mmap=cache_load_mmap,
     )
 
     # ASU protein centroid; adding it back returns predictions to the input frame.
     data.center = center.squeeze(0)  # (3,)
 
-    if out_dir is not None:
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(data, out_dir / f"{cache_key}.pt")
+    # Saved before embeddings are attached, so the file stays small.
+    if graph_path is not None:
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(data, graph_path)
 
+    _attach_embeddings(
+        data,
+        encoder_type=encoder_type,
+        processed_dir=processed_dir,
+        cache_load_mmap=cache_load_mmap,
+    )
     return data
 
 
@@ -352,11 +370,8 @@ def _assemble_hetero(
     pp_unit_vectors,
     pp_rbf,
     pdb_id,
-    encoder_type,
-    processed_dir,
-    cache_load_mmap,
 ) -> HeteroData:
-    """Build the HeteroData and attach embeddings, mirroring __getitem__."""
+    """Build the HeteroData, mirroring __getitem__'s node layout."""
     data = HeteroData()
 
     num_residues = int(final_res_idx.max().item() + 1) if final_res_idx.numel() else 0
@@ -369,17 +384,9 @@ def _assemble_hetero(
     data["protein"].num_nodes = final_pos.size(0)
     data["protein"].num_residues = num_residues
     data["protein"].num_protein_residues = num_protein_residues
-
-    _attach_embeddings(
-        data,
-        encoder_type=encoder_type,
-        processed_dir=processed_dir,
-        cache_key=pdb_id,
-        num_asu_protein=num_asu_protein,
-        num_protein_residues=num_protein_residues,
-        emb_res_idx=emb_res_idx,
-        cache_load_mmap=cache_load_mmap,
-    )
+    # Per-atom row into the residue embedding table (-1 = no row: ligands and
+    # unmatched mates), kept so embeddings can be attached to a loaded graph.
+    data["protein"].emb_res_idx = emb_res_idx
 
     # Empty water nodes: the flow model samples candidates itself.
     data["water"].x = torch.zeros((0, NODE_FEATURE_DIM), dtype=torch.float32)
@@ -400,22 +407,19 @@ def _attach_embeddings(
     *,
     encoder_type: str,
     processed_dir,
-    cache_key: str,
-    num_asu_protein: int,
-    num_protein_residues: int,
-    emb_res_idx: torch.Tensor,
     cache_load_mmap: bool,
 ) -> None:
     """Load and attach cached embeddings, mirroring _annotate_data_with_embeddings."""
     if encoder_type == "gvp":
         return
     embedding_dir = Path(processed_dir) / encoder_type
+    cache_key = data.pdb_id
 
     if encoder_type == "slae":
         data["protein"].embedding = load_slae_embedding(
             embedding_dir=embedding_dir,
             cache_key=cache_key,
-            num_asu_protein=num_asu_protein,
+            num_asu_protein=int(data.num_asu_protein_atoms),
             total_num_atoms=data["protein"].num_nodes,
             cache_load_mmap=cache_load_mmap,
         )
@@ -424,9 +428,10 @@ def _attach_embeddings(
         residue_embeddings = load_esm_embedding(
             embedding_dir=embedding_dir,
             cache_key=cache_key,
-            num_protein_residues=num_protein_residues,
+            num_protein_residues=int(data["protein"].num_protein_residues),
             cache_load_mmap=cache_load_mmap,
         )
+        emb_res_idx = data["protein"].emb_res_idx
         atom_emb = residue_embeddings.new_zeros(
             data["protein"].num_nodes, residue_embeddings.size(1)
         )

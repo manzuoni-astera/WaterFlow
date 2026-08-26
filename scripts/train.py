@@ -225,7 +225,8 @@ def parse_args():
         default="esm",
         choices=["gvp", "slae", "esm"],
         help="Protein encoder. 'esm' (default) and 'slae' need embeddings "
-        "precomputed under --processed_dir; 'gvp' learns from coordinates alone.",
+        "precomputed under --processed_dir; 'gvp' learns from coordinates alone. "
+        "'slae' is legacy and untested with the current pipeline.",
     )
     p.add_argument("--encoder_ckpt", type=str, default=None)
     p.add_argument("--freeze_encoder", action="store_true")
@@ -1354,13 +1355,14 @@ def main():
         logger.info(f"Configuration saved to: {config_file}")
 
     # wandb logs only when --wandb_project is set, on rank 0; disabled mode
-    # makes wandb.log/finish no-ops and needs no login.
+    # makes wandb.log/finish no-ops and needs no login. mode=None leaves the
+    # WANDB_MODE environment variable in charge, so offline runs keep working.
     wandb.init(
         project=args.wandb_project,
         dir=args.wandb_dir,
         name=args.run_name,
         config=config_dict,
-        mode="online" if (main_proc and args.wandb_project) else "disabled",
+        mode=None if (main_proc and args.wandb_project) else "disabled",
     )
 
     model = build_model(args, device, encoder_config=encoder_config)
