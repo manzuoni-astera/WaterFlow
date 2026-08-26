@@ -1,10 +1,11 @@
 """Tests for scripts/predict_waters.py -- end-to-end water prediction.
 
-Unit tests cover the pure pieces (selection, model build, lenient load, path
+Unit tests cover the pure pieces (selection, model build, checkpoint load, path
 collection, frame recovery). The integration test runs the whole pipeline with
 tiny untrained gvp models, so it needs no trained checkpoints or embeddings.
 """
 
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,9 +14,10 @@ import pytest
 import torch
 
 from scripts.predict_waters import (
+    _check_embeddings,
     _collect_struc_paths,
     _input_frame,
-    load_state_dict_lenient,
+    load_checkpoint,
     parse_args,
     predict_structures,
     select_waters,
@@ -23,6 +25,7 @@ from scripts.predict_waters import (
 from src.confidence import build_confidence_model, ConfidenceGVP
 from src.dataset import parse_asu_with_biotite
 from src.flow import FlowMatcher, FlowWaterGVP
+from src.inference_graph import build_inference_graph
 from src.structure_io import read_space_group
 
 
@@ -85,7 +88,7 @@ class TestSelectionCLI:
 
     @staticmethod
     def _parse(*extra: str):
-        base = ["--flow_run_dir", "f", "--confidence_run_dir", "c"]
+        base = ["--ckpt_dir", "c"]
         base += ["--struc", "s.pdb", "--out_dir", "o"]
         return parse_args(base + list(extra))
 
@@ -122,39 +125,72 @@ class TestModelBuildAndLoad:
         model = build_confidence_model(cfg, torch.device("cpu"))
         assert isinstance(model, ConfidenceGVP)
 
-    def test_lenient_load_round_trips(self, tmp_path):
+    def test_load_round_trips(self, tmp_path):
         cfg = {"encoder_type": "gvp", "hidden_s": 64, "hidden_v": 8, "flow_layers": 1}
         m1 = build_confidence_model(cfg, torch.device("cpu"))
         ckpt = tmp_path / "best.pt"
         torch.save({"model_state_dict": m1.state_dict()}, ckpt)
 
         m2 = build_confidence_model(cfg, torch.device("cpu"))
-        load_state_dict_lenient(m2, ckpt, torch.device("cpu"))  # no raise
+        load_checkpoint(m2, ckpt, torch.device("cpu"))  # no raise
         assert not m2.training  # switched to eval
 
     def test_missing_checkpoint_raises(self, tmp_path):
         cfg = {"encoder_type": "gvp", "hidden_s": 64, "hidden_v": 8, "flow_layers": 1}
         model = build_confidence_model(cfg, torch.device("cpu"))
         with pytest.raises(FileNotFoundError):
-            load_state_dict_lenient(model, tmp_path / "nope.pt", torch.device("cpu"))
+            load_checkpoint(model, tmp_path / "nope.pt", torch.device("cpu"))
+
+    def test_extra_checkpoint_keys_tolerated(self, tmp_path):
+        # A checkpoint with tensors for a module the model no longer has (here a
+        # second layer) loads fine: the surplus keys are dropped.
+        base = {"encoder_type": "gvp", "hidden_s": 64, "hidden_v": 8}
+        big = build_confidence_model({**base, "flow_layers": 2}, torch.device("cpu"))
+        ckpt = tmp_path / "big.pt"
+        torch.save({"model_state_dict": big.state_dict()}, ckpt)
+
+        small = build_confidence_model({**base, "flow_layers": 1}, torch.device("cpu"))
+        load_checkpoint(small, ckpt, torch.device("cpu"))  # no raise
+        assert not small.training
+
+    def test_missing_key_raises(self, tmp_path):
+        # A checkpoint lacking a live parameter (here a second layer) would leave
+        # it at init, so the load must fail loud rather than warn.
+        base = {"encoder_type": "gvp", "hidden_s": 64, "hidden_v": 8}
+        small = build_confidence_model({**base, "flow_layers": 1}, torch.device("cpu"))
+        ckpt = tmp_path / "small.pt"
+        torch.save({"model_state_dict": small.state_dict()}, ckpt)
+
+        big = build_confidence_model({**base, "flow_layers": 2}, torch.device("cpu"))
+        with pytest.raises(RuntimeError, match="missing from the checkpoint"):
+            load_checkpoint(big, ckpt, torch.device("cpu"))
 
 
 @pytest.mark.unit
 class TestInputsAndFrame:
-    def test_single_struc_path(self, pdb_6eey):
-        paths = _collect_struc_paths(SimpleNamespace(struc=pdb_6eey, pdb_list=None))
+    def test_struc_paths(self, pdb_6eey):
+        paths = _collect_struc_paths(SimpleNamespace(struc=[pdb_6eey], pdb_list=None))
         assert paths == [pdb_6eey]
 
-    def test_pdb_list_resolves_names_with_and_without_ext(self, pdb_6eey, tmp_path):
-        base = Path(pdb_6eey).parent
+    def test_duplicate_names_rejected(self):
+        args = SimpleNamespace(struc=["a/protein.cif", "b/protein.cif"], pdb_list=None)
+        with pytest.raises(ValueError, match="protein"):
+            _collect_struc_paths(args)
+
+    def test_pdb_list_resolves_names_with_and_without_ext(
+        self, pdb_6eey, pdb_4h0b, tmp_path
+    ):
+        base = tmp_path / "pdbs"
+        base.mkdir()
+        shutil.copy(pdb_6eey, base)
+        shutil.copy(pdb_4h0b, base)
         lst = tmp_path / "list.txt"
         # one entry carries an extension, one omits it; both resolve to a file
-        lst.write_text(f"{Path(pdb_6eey).name}\n6eey_final\n")
+        lst.write_text("6eey_final.pdb\n4h0b_final\n")
         paths = _collect_struc_paths(
             SimpleNamespace(struc=None, pdb_list=str(lst), base_pdb_dir=str(base))
         )
-        assert len(paths) == 2
-        assert all(Path(p).stem == "6eey_final" for p in paths)
+        assert [Path(p).stem for p in paths] == ["6eey_final", "4h0b_final"]
 
     def test_pdb_list_warns_on_missing(self, tmp_path):
         lst = tmp_path / "list.txt"
@@ -165,12 +201,40 @@ class TestInputsAndFrame:
         assert paths == []
 
     def test_input_frame(self, pdb_4h0b):
-        kept, center, space_group = _input_frame(pdb_4h0b)
+        kept, space_group = _input_frame(pdb_4h0b)
         protein, _w, lig = parse_asu_with_biotite(pdb_4h0b)
         assert int((kept.res_name == "HOH").sum()) == 0
         assert len(kept) == len(protein) + len(lig)
-        assert np.allclose(center, protein.coord.mean(axis=0))
         assert space_group == "P 6"
+
+    def test_graph_center_is_protein_centroid(self, pdb_4h0b):
+        # predict_waters adds graph.center back to un-centre predictions, so it
+        # must equal the ASU protein centroid the graph was built on.
+        graph = build_inference_graph(pdb_4h0b, encoder_type="gvp")
+        protein, _w, _lig = parse_asu_with_biotite(pdb_4h0b)
+        assert graph.center.shape == (3,)
+        assert np.allclose(graph.center.numpy(), protein.coord.mean(axis=0), atol=1e-4)
+
+
+@pytest.mark.unit
+class TestCheckEmbeddings:
+    def test_gvp_skips_check(self):
+        # gvp needs no embeddings, so nothing is required even with no cache.
+        _check_embeddings(["/no/such/protein.cif"], "gvp", None)
+
+    def test_missing_processed_dir_raises(self):
+        with pytest.raises(ValueError, match="processed_dir"):
+            _check_embeddings(["a/protein.cif"], "esm", None)
+
+    def test_missing_esm_embedding_raises_naming_files(self, tmp_path):
+        with pytest.raises(ValueError, match=r"protein\.cif.*other\.pdb"):
+            _check_embeddings(["a/protein.cif", "b/other.pdb"], "esm", str(tmp_path))
+
+    def test_present_esm_embeddings_pass(self, tmp_path):
+        emb = tmp_path / "esm"
+        emb.mkdir()
+        (emb / "protein.pt").touch()
+        _check_embeddings(["some/dir/protein.cif"], "esm", str(tmp_path))
 
 
 @pytest.mark.integration
@@ -240,3 +304,55 @@ class TestEndToEnd:
         assert rows.shape[0] == n_waters
         assert np.allclose(rows[:, :3], written.coord[is_water], atol=1e-3)
         assert ((rows[:, 3] >= 0) & (rows[:, 3] <= 1)).all()
+
+    def test_predict_cache_writes_and_reuses(self, pdb_4h0b, gvp_encoder, tmp_path):
+        """A second run reuses the cached graph and candidates, so its predicted
+        waters are identical instead of freshly sampled."""
+        device = torch.device("cpu")
+        flow_model = FlowWaterGVP(
+            encoder=gvp_encoder, hidden_dims=(64, 8), layers=1
+        ).to(device)
+        flow_model.eval()
+        flow_matcher = FlowMatcher(model=flow_model, sampling_strategy="uniform_ball")
+        conf_model = build_confidence_model(
+            {"encoder_type": "gvp", "hidden_s": 64, "hidden_v": 8, "flow_layers": 1},
+            device,
+        )
+        conf_model.eval()  # deterministic scores, so reuse yields identical output
+        cache = tmp_path / "predict_cache"
+
+        def run(out_dir):
+            args = SimpleNamespace(
+                processed_dir=None,
+                include_mates=False,
+                method="euler",
+                num_steps=2,
+                water_ratio=1.0,
+                selection="confidence",
+                confidence_threshold=0.0,
+                density_ratio=None,
+                out_dir=str(out_dir),
+                out_format=".pdb",
+            )
+            predict_structures(
+                [pdb_4h0b],
+                flow_matcher,
+                conf_model,
+                {"encoder_type": "gvp"},
+                args,
+                device,
+                cache=cache,
+            )
+
+        run(tmp_path / "out1")
+        graph_pt = cache / "4h0b_final.pt"
+        cand_pt = cache / "candidates" / "4h0b_final.pt"
+        assert graph_pt.exists(), "flow-input graph not cached"
+        assert cand_pt.exists(), "candidate waters not cached"
+        assert "candidate_pos" in torch.load(cand_pt, weights_only=False)
+
+        # Second run reuses the cached candidates -> identical predicted waters.
+        run(tmp_path / "out2")
+        r1 = np.loadtxt(tmp_path / "out1" / "4h0b_final_waters.txt").reshape(-1, 4)
+        r2 = np.loadtxt(tmp_path / "out2" / "4h0b_final_waters.txt").reshape(-1, 4)
+        assert r1.shape == r2.shape and np.allclose(r1, r2, atol=1e-4)

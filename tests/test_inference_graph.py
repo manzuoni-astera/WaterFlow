@@ -168,10 +168,19 @@ class TestBatching:
 
 @pytest.mark.unit
 class TestPersistence:
-    def test_out_dir_writes_graph(self, pdb_6eey, tmp_path):
-        out = tmp_path / "processed_inf"
-        data = build_inference_graph(pdb_6eey, encoder_type="gvp", out_dir=str(out))
-        saved = out / "6eey_final.pt"
+    def test_cache_dir_saves_and_loads(self, pdb_6eey, tmp_path):
+        cache = tmp_path / "predict_cache"
+        data = build_inference_graph(pdb_6eey, encoder_type="gvp", cache_dir=str(cache))
+        saved = cache / "6eey_final.pt"
         assert saved.exists()
-        reloaded = torch.load(saved, weights_only=False)
+
+        # Mark the stored graph; the marker surviving proves the second call
+        # loads the file instead of rebuilding.
+        stored = torch.load(saved, weights_only=False)
+        stored.marker = 1
+        torch.save(stored, saved)
+        reloaded = build_inference_graph(
+            pdb_6eey, encoder_type="gvp", cache_dir=str(cache)
+        )
+        assert reloaded.marker == 1
         assert reloaded["protein"].num_nodes == data["protein"].num_nodes

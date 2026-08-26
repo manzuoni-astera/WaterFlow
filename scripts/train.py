@@ -10,10 +10,11 @@ model. It handles:
 - Checkpointing and W&B logging
 
 Usage:
-    python scripts/train.py \\
+    python -m scripts.train \\
         --train_list /path/to/train.txt \\
         --val_list /path/to/val.txt \\
-        --encoder_type gvp \\
+        --processed_dir /path/to/cache \\
+        --base_pdb_dir /path/to/pdbs \\
         --epochs 200 \\
         --batch_size 4
 """
@@ -91,13 +92,6 @@ def parse_args():
     # Example: --config config.yaml would load all arguments from the file,
     # with CLI args taking precedence for overrides.
 
-    # TODO: Remove hardcoded default paths. These should be required arguments
-    # or loaded from environment variables / config files for portability.
-    # Current hardcoded paths:
-    #   - processed_dir: /home/srivasv/flow_cache/
-    #   - base_pdb_dir: /sb/wankowicz_lab/data/srivasv/pdb_redo_data
-    #   - save_dir: /home/srivasv/flow_checkpoints
-    #   - wandb_dir: /home/srivasv/wandb_logs
     p = argparse.ArgumentParser()
 
     # data
@@ -106,7 +100,7 @@ def parse_args():
     p.add_argument(
         "--processed_dir",
         type=str,
-        default="/home/srivasv/flow_cache/",
+        required=True,
         help=(
             "Cache root. Geometry caches are expected in <processed_dir>/geometry, "
             "embeddings in <processed_dir>/<encoder_name>."
@@ -115,7 +109,8 @@ def parse_args():
     p.add_argument(
         "--base_pdb_dir",
         type=str,
-        default="/sb/wankowicz_lab/data/srivasv/pdb_redo_data",
+        required=True,
+        help="Base directory of PDB subdirectories used to build the geometry cache.",
     )
     p.add_argument(
         "--geometry_cache_name",
@@ -225,7 +220,13 @@ def parse_args():
 
     # model
     p.add_argument(
-        "--encoder_type", type=str, default="gvp", choices=["gvp", "slae", "esm"]
+        "--encoder_type",
+        type=str,
+        default="esm",
+        choices=["gvp", "slae", "esm"],
+        help="Protein encoder. 'esm' (default) and 'slae' need embeddings "
+        "precomputed under --processed_dir; 'gvp' learns from coordinates alone. "
+        "'slae' is legacy and untested with the current pipeline.",
     )
     p.add_argument("--encoder_ckpt", type=str, default=None)
     p.add_argument("--freeze_encoder", action="store_true")
@@ -415,7 +416,7 @@ def parse_args():
     )
 
     # checkpointing
-    p.add_argument("--save_dir", type=str, default="/home/srivasv/flow_checkpoints")
+    p.add_argument("--save_dir", type=str, default="flow_checkpoints")
     p.add_argument(
         "--run_name",
         type=str,
@@ -479,8 +480,14 @@ def parse_args():
     # logging / wandb
     p.add_argument("--log_level", type=str, default="INFO")
     p.add_argument("--log_file", type=str, default=None)
-    p.add_argument("--wandb_project", type=str, default="water-flow")
-    p.add_argument("--wandb_dir", type=str, default="/home/srivasv/wandb_logs")
+    p.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="If set, log to this wandb project. Omit to disable wandb "
+        "(no login required).",
+    )
+    p.add_argument("--wandb_dir", type=str, default=None)
     p.add_argument("--device", type=str, default="cuda")
     args = p.parse_args()
     if args.encoder_type == "gvp" and args.embedding_dim is not None:
@@ -1347,14 +1354,15 @@ def main():
             json.dump(config_dict, f, indent=2)
         logger.info(f"Configuration saved to: {config_file}")
 
-    # Non-main ranks get a disabled wandb client, so wandb.log is a no-op there.
-    # mode=None on rank 0 means WANDB_MODE (default online) applies.
+    # wandb logs only when --wandb_project is set, on rank 0; disabled mode
+    # makes wandb.log/finish no-ops and needs no login. mode=None leaves the
+    # WANDB_MODE environment variable in charge, so offline runs keep working.
     wandb.init(
         project=args.wandb_project,
         dir=args.wandb_dir,
         name=args.run_name,
         config=config_dict,
-        mode=None if main_proc else "disabled",
+        mode=None if (main_proc and args.wandb_project) else "disabled",
     )
 
     model = build_model(args, device, encoder_config=encoder_config)

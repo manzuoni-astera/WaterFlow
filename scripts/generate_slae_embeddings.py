@@ -9,7 +9,7 @@ This script:
 2. For each entry, loads the PDB and converts to atom37 representation
 3. Runs SLAE encoder to get atom-level embeddings
 4. Aligns embeddings to match geometry cache's atom order
-5. Saves embeddings to separate .pt files in cache_dir/slae/
+5. Saves embeddings to separate .pt files in processed_dir/slae/
 
 SLAE only produces embeddings for atoms with canonical names (37 standard atom
 types). Non-canonical atoms (e.g., from modified residues like 65T, DAL, MLE)
@@ -17,8 +17,8 @@ get zero vectors to maintain alignment with the geometry cache.
 
 Usage:
     uv run python -m scripts.generate_slae_embeddings \
-        --split_file /path/to/split.txt \
-        --cache_dir /path/to/cache \
+        --pdb_list /path/to/split.txt \
+        --processed_dir /path/to/cache \
         --base_pdb_dir /path/to/pdbs \
         [--slae_ckpt /path/to/checkpoint] \
         [--slae_config /path/to/config]
@@ -287,21 +287,21 @@ def main() -> None:
         description="Precompute SLAE embeddings for protein structures"
     )
     parser.add_argument(
-        "--split_file",
+        "--pdb_list",
         type=Path,
         required=True,
         help="Text file with PDB entries (one per line, e.g., '6eey_final')",
     )
     parser.add_argument(
-        "--cache_dir",
+        "--processed_dir",
         type=Path,
         required=True,
-        help="Base cache directory; embeddings saved to {cache_dir}/slae/",
+        help="Base cache directory; embeddings saved to {processed_dir}/slae/",
     )
     parser.add_argument(
         "--base_pdb_dir",
         type=Path,
-        default=Path("/sb/wankowicz_lab/data/srivasv/pdb_redo_data"),
+        required=True,
         help="Base directory containing PDB subdirectories",
     )
     parser.add_argument(
@@ -337,7 +337,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    slae_cache_dir = args.cache_dir / "slae"
+    slae_cache_dir = args.processed_dir / "slae"
     slae_cache_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -356,7 +356,7 @@ def main() -> None:
     featurizer = ProteinGraphFeaturizer(radius=8.0, use_atom37=True)
 
     # parse split file
-    entries = parse_split_file(args.split_file, args.base_pdb_dir)
+    entries = parse_split_file(args.pdb_list, args.base_pdb_dir)
     logger.info(f"Found {len(entries)} entries in split file")
 
     if args.batch_limit:

@@ -7,17 +7,24 @@ This script:
 3. Sanitizes the AtomArray in-memory (removes HETATM flags, standardizes residue
    names) so ESM3 structurally embeds non-canonical residues (mapped to 'UNK'/'X').
 4. Runs ESM3 to get per-residue embeddings.
-5. Saves embeddings to separate .pt files in cache_dir/esm/
+5. Saves embeddings to separate .pt files in processed_dir/esm/
 
 Usage:
+    # training layout: keyed by split entry ('6eey_final' -> esm/6eey_final.pt)
     uv run python -m scripts.generate_esm_embeddings \
-        --split_file /path/to/split.txt \
-        --cache_dir /path/to/cache \
+        --pdb_list /path/to/split.txt \
+        --processed_dir /path/to/cache \
         --base_pdb_dir /path/to/pdbs \
         [--device cuda:0] \
         [--model_name esm3-open] \
         [--batch_limit 10] \
         [--overwrite]
+
+    # raw structures: keyed by file stem (protein.cif -> esm/protein.pt), which
+    # is how predict_waters looks embeddings up
+    uv run python -m scripts.generate_esm_embeddings \
+        --struc protein.cif other.pdb \
+        --processed_dir /path/to/cache
 
 Output format (per cache file):
     {
@@ -30,6 +37,7 @@ Output format (per cache file):
 
 import argparse
 import io
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -163,23 +171,31 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate ESM3 embeddings for protein structures"
     )
-    parser.add_argument(
-        "--split_file",
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument(
+        "--pdb_list",
         type=Path,
-        required=True,
-        help="Text file with PDB entries (one per line, e.g., '6eey_final')",
+        help="Text file with PDB entries (one per line, e.g., '6eey_final'); "
+        "resolved under --base_pdb_dir and keyed by split entry.",
+    )
+    src.add_argument(
+        "--struc",
+        type=Path,
+        nargs="+",
+        help="One or more raw PDB/CIF files, keyed by file stem "
+        "(protein.cif -> esm/protein.pt). Use this for prediction inputs.",
     )
     parser.add_argument(
-        "--cache_dir",
+        "--processed_dir",
         type=Path,
         required=True,
-        help="Base cache directory; embeddings saved to {cache_dir}/esm/",
+        help="Base cache directory; embeddings saved to {processed_dir}/esm/",
     )
     parser.add_argument(
         "--base_pdb_dir",
         type=Path,
-        default=Path("/sb/wankowicz_lab/data/srivasv/pdb_redo_data"),
-        help="Base directory containing PDB subdirectories",
+        default=None,
+        help="Base directory containing PDB subdirectories; required with --pdb_list",
     )
     parser.add_argument(
         "--model_name",
@@ -206,20 +222,29 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.pdb_list and args.base_pdb_dir is None:
+        parser.error("--pdb_list requires --base_pdb_dir")
+    if args.struc:
+        counts = Counter(p.stem for p in args.struc)
+        duplicates = sorted(s for s, n in counts.items() if n > 1)
+        if duplicates:
+            parser.error(
+                f"duplicate structure names {duplicates}: embeddings are keyed "
+                "by file stem, so every --struc file needs a distinct name"
+            )
 
-    esm_cache_dir = args.cache_dir / "esm"
+    esm_cache_dir = args.processed_dir / "esm"
     esm_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-
-    logger.info(f"Loading ESM3 model: {args.model_name}...")
-    model = ESM3.from_pretrained(args.model_name).to(device)
-    model.eval()
-    logger.info("Model loaded.")
-
-    entries = parse_split_file(args.split_file, args.base_pdb_dir)
-    logger.info(f"Found {len(entries)} entries in split file")
+    if args.struc:
+        # Key by file stem, matching how predict_waters looks embeddings up.
+        entries = [
+            {"cache_key": p.stem, "struc_path": p, "pdb_id": p.stem} for p in args.struc
+        ]
+        logger.info(f"Embedding {len(entries)} structure(s) passed via --struc")
+    else:
+        entries = parse_split_file(args.pdb_list, args.base_pdb_dir)
+        logger.info(f"Found {len(entries)} entries in split file")
 
     if args.batch_limit:
         entries = entries[: args.batch_limit]
@@ -237,6 +262,14 @@ def main() -> None:
     if not entries:
         logger.info("No entries to process. Done.")
         return
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+
+    logger.info(f"Loading ESM3 model: {args.model_name}...")
+    model = ESM3.from_pretrained(args.model_name).to(device)
+    model.eval()
+    logger.info("Model loaded.")
 
     success_count = 0
     failures = []

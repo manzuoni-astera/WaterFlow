@@ -7,10 +7,12 @@ Takes a text file of PDB paths, runs trajectory integration (euler/rk4),
 and outputs plots, gifs, and metrics for each PDB.
 
 Usage:
-    python scripts/inference.py \
-        --run_dir /path/to/run_directory \
+    python -m scripts.inference \
+        --flow_run_dir /path/to/run_directory \
         --pdb_list /path/to/pdb_list.txt \
-        --output_dir /path/to/output \
+        --processed_dir /path/to/cache \
+        --base_pdb_dir /path/to/pdbs \
+        --out_dir /path/to/output \
         --method rk4 \
         --num_steps 100 \
         --save_gifs
@@ -55,15 +57,10 @@ def parse_args():
     # This would simplify inference invocation and ensure reproducibility.
     # Example: --config config.yaml would load inference settings.
 
-    # TODO: Remove hardcoded default paths. These should be required arguments
-    # or loaded from environment variables / config files for portability.
-    # Current hardcoded paths:
-    #   - processed_dir: /home/srivasv/flow_cache/
-    #   - base_pdb_dir: /sb/wankowicz_lab/data/srivasv/pdb_redo_data
     p = argparse.ArgumentParser(description="Run WaterFlow inference on PDB files")
 
     p.add_argument(
-        "--run_dir",
+        "--flow_run_dir",
         type=str,
         required=True,
         help="Path to training run directory (contains config.json and checkpoints/)",
@@ -75,7 +72,7 @@ def parse_args():
         help="Text file with PDB entries (one per line, format: pdb_id_final or pdb_id_final_chainID)",
     )
     p.add_argument(
-        "--output_dir",
+        "--out_dir",
         type=str,
         required=True,
         help="Directory to save inference outputs",
@@ -85,7 +82,7 @@ def parse_args():
     p.add_argument(
         "--processed_dir",
         type=str,
-        default="/home/srivasv/flow_cache/",
+        required=True,
         help="Parent directory containing all cached preprocessed data. This directory holds "
         "protein graphs, embeddings, and geometry subdirectories (e.g., processed_dir/geometry/). "
         "Each PDB's preprocessed data is stored in subdirectories organized by cache type.",
@@ -93,7 +90,7 @@ def parse_args():
     p.add_argument(
         "--base_pdb_dir",
         type=str,
-        default="/sb/wankowicz_lab/data/srivasv/pdb_redo_data",
+        required=True,
         help="Base directory containing PDB subdirectories for dataset creation",
     )
     p.add_argument(
@@ -102,7 +99,7 @@ def parse_args():
         help="Include symmetry mate atoms as protein nodes",
     )
     p.add_argument(
-        "--geometry_cache",
+        "--geometry_cache_name",
         type=str,
         default=None,
         help="Subdirectory name within processed_dir specifying which water coordinate set to use. "
@@ -115,7 +112,7 @@ def parse_args():
         "--checkpoint",
         type=str,
         default="best.pt",
-        help="Checkpoint filename within run_dir/checkpoints/ (default: best.pt)",
+        help="Checkpoint filename within flow_run_dir/checkpoints/ (default: best.pt)",
     )
 
     # integration arguments
@@ -389,8 +386,8 @@ def main():
     args = parse_args()
 
     # setup paths
-    run_dir = Path(args.run_dir)
-    output_root = Path(args.output_dir)
+    run_dir = Path(args.flow_run_dir)
+    output_root = Path(args.out_dir)
     output_dir = output_root / run_dir.name
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "plots").mkdir(exist_ok=True)
@@ -424,8 +421,8 @@ def main():
     include_mates = args.include_mates or config.get("include_mates", False)
     encoder_type = config.get("encoder_type", "gvp")
 
-    # Use --geometry_cache if provided, otherwise use config's geometry_cache_name
-    geometry_cache_name = args.geometry_cache or config.get(
+    # Use --geometry_cache_name if provided, otherwise the config value
+    geometry_cache_name = args.geometry_cache_name or config.get(
         "geometry_cache_name", "geometry"
     )
 
@@ -593,14 +590,14 @@ def main():
                     "summary": summary,
                     "per_sample": all_metrics,
                     "config": {
-                        "run_dir": str(run_dir),
+                        "flow_run_dir": str(run_dir),
                         "checkpoint": args.checkpoint,
                         "method": args.method,
                         "num_steps": args.num_steps,
                         "threshold": args.threshold,
                         "include_mates": include_mates,
                         "water_ratio": args.water_ratio,
-                        "geometry_cache": geometry_cache_name,
+                        "geometry_cache_name": geometry_cache_name,
                     },
                 },
                 f,
