@@ -222,8 +222,6 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    if not args.struc and not args.pdb_list:
-        parser.error("provide --struc <files> or --pdb_list <file>")
     if args.pdb_list and args.base_pdb_dir is None:
         parser.error("--pdb_list requires --base_pdb_dir")
     if args.struc:

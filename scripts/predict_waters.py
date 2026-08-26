@@ -216,7 +216,7 @@ def predict_structures(
     for i, name in enumerate(out_names):
         cand_pt = _candidate_path(cache, name) if cache else None
         if cand_pt is not None and cand_pt.exists():
-            candidates[i] = torch.load(cand_pt, weights_only=False)["candidate_pos"]
+            candidates[i] = torch.load(cand_pt, weights_only=True)["candidate_pos"]
         else:
             todo_idx.append(i)
             todo_graphs.append(graphs[i])
@@ -443,8 +443,14 @@ def main() -> None:
     flow_config = json.loads((ckpt_dir / "flow_config.json").read_text())
     conf_config = json.loads((ckpt_dir / "confidence_config.json").read_text())
     conf_config = conf_config.get("flow_config", conf_config)  # confidence runs nest it
+    ckpt_mates = flow_config.get("include_mates", False)
     if args.include_mates is None:
-        args.include_mates = flow_config.get("include_mates", False)
+        args.include_mates = ckpt_mates
+    elif args.include_mates != ckpt_mates:
+        logger.warning(
+            f"--include_mates={args.include_mates} but the checkpoint was trained "
+            f"with include_mates={ckpt_mates}; graphs will not match training"
+        )
 
     # Graphs are built with ESM or with plain GVP, based on the checkpoint
     flow_encoder = flow_config.get("encoder_type", "gvp")
@@ -466,7 +472,7 @@ def main() -> None:
     if args.predict_cache:
         mates = "mates" if args.include_mates else "nomates"
         cache = Path(args.predict_cache) / (
-            f"{ckpt_dir.resolve().name}_{mates}"
+            f"{ckpt_dir.resolve().name}_ckpt_{mates}"
             f"_{args.method}{args.num_steps}_r{args.water_ratio:g}"
         )
 
