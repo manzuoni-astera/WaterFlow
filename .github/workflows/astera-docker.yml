@@ -1,0 +1,108 @@
+name: WaterFlow ACTL image
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile.astera
+      - docker/actl-*
+      - docker/entrypoint.sh
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/astera-docker.yml
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.astera
+      - docker/actl-*
+      - docker/entrypoint.sh
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/astera-docker.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  WATERFLOW_BASE_IMAGE: docker.io/diffuseproject/waterflow@sha256:cfa4d600c88adf5223814e2c1861de85bf6047fe279c0df44f44cb4a8e6c65dc
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate overlay scripts and inputs
+        run: |
+          set -euo pipefail
+          bash -n docker/entrypoint.sh docker/actl-shell-init.sh docker/actl-waterflow
+          grep -q '^ENTRYPOINT \[\]$' Dockerfile.astera
+          grep -q '^CMD \["bash"\]$' Dockerfile.astera
+          grep -q '^ARG WATERFLOW_BASE_IMAGE=' Dockerfile.astera
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: astera-sh-builder
+    env:
+      ASTERA_REGISTRY: ${{ secrets.ASTERA_REGISTRY }}
+      ASTERA_IMAGE_NAME: library/waterflow
+    steps:
+      - name: Verify registry configuration
+        run: |
+          set -euo pipefail
+          if [ -z "${ASTERA_REGISTRY}" ]; then
+            echo "ASTERA_REGISTRY repository secret must be set." >&2
+            exit 1
+          fi
+          case "${ASTERA_REGISTRY}" in
+            docker.io|index.docker.io|registry-1.docker.io)
+              echo "ASTERA_REGISTRY must be an internal registry." >&2
+              exit 1 ;;
+          esac
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ASTERA_REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Build and publish ACTL overlay
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.astera
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.ASTERA_REGISTRY }}/${{ env.ASTERA_IMAGE_NAME }}:main-actl
+            ${{ env.ASTERA_REGISTRY }}/${{ env.ASTERA_IMAGE_NAME }}:sha-${{ github.sha }}
+          build-args: |
+            WATERFLOW_BASE_IMAGE=${{ env.WATERFLOW_BASE_IMAGE }}
+          cache-from: type=registry,ref=${{ env.ASTERA_REGISTRY }}/${{ env.ASTERA_IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.ASTERA_REGISTRY }}/${{ env.ASTERA_IMAGE_NAME }}:buildcache,mode=max
+          provenance: false
+      - name: Smoke-test published image
+        run: |
+          set -euo pipefail
+          image="${ASTERA_REGISTRY}/${ASTERA_IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker pull "$image"
+          docker run --rm --entrypoint bash "$image" -lc '
+            test -L /data
+            test "$(readlink /data)" = /mnt/diffuse-shared/waterflow
+            test -x /usr/local/bin/waterflow
+            python -c "import sklearn; import src.utils"
+          '
+          docker run --rm -v "$GITHUB_WORKSPACE:/home/dev/workspace:ro" "$image" waterflow --help
+          docker run --rm -v "$GITHUB_WORKSPACE:/home/dev/workspace:ro" "$image" waterflow train --help
+          docker run --rm -v "$GITHUB_WORKSPACE:/home/dev/workspace:ro" "$image" waterflow inference --help
+          docker run --rm -v "$GITHUB_WORKSPACE:/home/dev/workspace:ro" "$image" waterflow generate-esm --help
