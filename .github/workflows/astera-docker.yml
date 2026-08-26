@@ -38,7 +38,7 @@ jobs:
           bash -n docker/entrypoint.sh docker/actl-shell-init.sh docker/actl-waterflow
           grep -q '^ENTRYPOINT \[\]$' Dockerfile.astera
           grep -q '^CMD \["bash"\]$' Dockerfile.astera
-          grep -q '^WATERFLOW_BASE_IMAGE=' Dockerfile.astera
+          grep -q '^ARG WATERFLOW_BASE_IMAGE=' Dockerfile.astera
 
   publish:
     if: github.event_name != 'pull_request'

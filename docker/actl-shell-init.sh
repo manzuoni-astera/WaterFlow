@@ -23,7 +23,9 @@ esac
 export PYTHONPATH
 
 if [ -d /mnt/diffuse-shared ]; then
-  mkdir -p /mnt/diffuse-shared/waterflow/{pdb,cache,checkpoints,outputs,logs,splits} 2>/dev/null || true
+  if ! mkdir -p /mnt/diffuse-shared/waterflow/{pdb,cache,checkpoints,outputs,logs,splits}; then
+    printf 'waterflow: warning: could not initialize shared storage under /mnt/diffuse-shared/waterflow\n' >&2
+  fi
 fi
 
 case "$-" in
